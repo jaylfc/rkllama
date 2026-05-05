@@ -494,7 +494,7 @@ def run_rknn_process(name, task, model_input):
             parent_pipe, child_pipe = Pipe()
 
             # Define the process for the encoder
-            rknn_process = Process(target=run_image_generator, args=(model_input,child_pipe,))
+            rknn_process = Process(target=run_image_generator, args=(model_input,child_pipe,), daemon=True)
 
             # Start the encoder worker
             rknn_process.start() 
@@ -1358,15 +1358,29 @@ class Worker:
         Creates the process of the worker
         """
 
-        # Define the process for the worker
+        # Define the process for the worker.
+        #
+        # daemon=True ties the worker to the lifetime of the rkllama_server
+        # main process: when main exits (clean Python exit, including the
+        # Flask "Address already in use" sys.exit(1) path), the worker is
+        # terminated by Python's atexit machinery. Without this, workers
+        # leak across restarts because they're forked outside the systemd
+        # cgroup that the rkllama.service unit is tracked in, hold the
+        # listening FD they inherited, and block subsequent restarts with
+        # 'Address already in use'.
+        #
+        # Note: this is *not* PR_SET_PDEATHSIG (which is bound to the
+        # forking thread, not the parent process — see the comment in
+        # _set_parent_death_signal). daemon=True binds to the parent
+        # *process*, which is what we want.
         # Check if it is a RKLLM or RKNN model
-        if is_rkllm_model(self.worker_model_info.model): 
+        if is_rkllm_model(self.worker_model_info.model):
             # RKLLM
-            self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.worker_pipe, self.abort_flag, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_id))
-        
+            self.process = Process(target=run_rkllm_worker, args=(self.worker_model_info.model, self.worker_pipe, self.abort_flag, model_path, model_dir, options, lora_model_path, prompt_cache_path, base_domain_id), daemon=True)
+
         else:
             # RKNN
-            self.process = Process(target=run_rknn_worker, args=(self.worker_model_info.model, self.worker_pipe, model_dir, options))
+            self.process = Process(target=run_rknn_worker, args=(self.worker_model_info.model, self.worker_pipe, model_dir, options), daemon=True)
             
         # Start the worker
         self.process.start() 
