@@ -97,6 +97,7 @@ WORKER_TASK_GENERATE_IMAGE = "GENERATE_IMAGE"
 WORKER_TASK_GENERATE_SPEECH = "GENERATE_SPEECH"
 WORKER_TASK_GENERATE_TRANSCRIPTION = "GENERATE_TRANSCRIPTION"
 WORKER_TASK_GENERATE_TRANSLATION = "GENERATE_TRANSLATION"
+WORKER_TASK_RERANK = "RERANK"
 
 
 def run_encoder(model_input):
@@ -222,7 +223,7 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
     _set_parent_death_signal()
 
     # Initialize individual callback for each worker to prevent error from RKLLM
-    from .callback import callback_impl, global_text, last_embeddings, global_metrics
+    from .callback import callback_impl, global_text, last_embeddings, last_logits, global_metrics
     from .rkllm import RKLLM
 
     # Connect the callback function between Python and C++ independently for each worker
@@ -339,11 +340,38 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
 
                 if last_embeddings:
                     # Send the embedding shapes of the input
-                    child_conn.send(last_embeddings[-1])  
+                    child_conn.send(last_embeddings[-1])
 
                     # Close the connection
                     child_conn.close()
-            
+
+            elif task == WORKER_TASK_RERANK:
+                logger.info(f"Running rerank (get_logits) for model {name}...")
+                # Clear any previous logits
+                last_logits.clear()
+
+                # Run inference in GET_LOGITS mode
+                thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input,))
+                thread_model.start()
+
+                # Looping until execution of the thread finished
+                thread_finished = False
+                while not thread_finished:
+                    thread_model.join(timeout=0.005)
+                    thread_finished = not thread_model.is_alive()
+
+                if last_logits:
+                    # Send the last logits result
+                    child_conn.send(last_logits[-1])
+                else:
+                    # Fallback: send text output for text-based scoring
+                    text_output = "".join(global_text)
+                    child_conn.send({"text_fallback": text_output})
+                    global_text.clear()
+
+                # Close the connection
+                child_conn.close()
+
             elif task == WORKER_TASK_VISION_ENCODER:
                 logger.info(f"Running vision encoder for model {name}...")
                 # Run the vision encoder to get the image embedding
@@ -1224,12 +1252,42 @@ class WorkerManager:
             model_input = (text_input, prompt_cache_file)
 
             # Send the embedding task
-            parent_conn = self.send_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options))        
-            
+            parent_conn = self.send_task(model_name, (WORKER_TASK_EMBEDDING,RKLLMInferMode.RKLLM_INFER_GET_LAST_HIDDEN_LAYER, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, options))
+
             # Return the request parent pipe connection
             return parent_conn
 
-    
+
+    def rerank(self, model_name, prompt_input, prompt_cache_file=None):
+        """
+        Send a rerank task (get_logits mode) to the corresponding model worker
+
+        Args:
+            model_name (str): Model name to invoke
+            prompt_input (str): Formatted rerank prompt
+            prompt_cache_file (str): Prompt cache file (optional)
+
+        Returns:
+            Connection (Pipe): result parent connection pipe to receive the response.
+        """
+        if model_name in self.workers.keys():
+            # Construct model input
+            model_input = (prompt_input, prompt_cache_file)
+
+            # Send the rerank task using GET_LOGITS inference mode
+            parent_conn = self.send_task(model_name, (WORKER_TASK_RERANK, RKLLMInferMode.RKLLM_INFER_GET_LOGITS, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input))
+
+            # Clear the KV cache after the rerank task. Without this, repeated rerank
+            # requests accumulate KV state on the NPU and response times degrade over
+            # hours of operation. The queue serializes this clear after the task above.
+            self.clear_cache_worker(model_name)
+
+            # Return the request parent pipe connection
+            return parent_conn
+
+        return None
+
+
     def multimodal(self, model_name, prompt_input, images, prompt_cache_file, options, video = None):
         """
         Send a inference task to the corresponding model worker for multimodal input
