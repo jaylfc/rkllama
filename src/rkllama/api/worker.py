@@ -354,15 +354,32 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input,))
                 thread_model.start()
 
-                # Looping until execution of the thread finished
+                # Rerank only needs the yes/no logits from the single decision step
+                # right after the prompt. The model would otherwise free-generate up to
+                # default_max_new_tokens (1024) tokens before the thread returns, which
+                # is far too slow (clients time out). Cap generation to 1 token: as soon
+                # as the first logits are captured, abort the inference so the model
+                # stops generating. Relative ranking is preserved because the yes/no
+                # softmax score is read from that first decision step.
+                first_logits_aborted = False
                 thread_finished = False
                 while not thread_finished:
+                    # Stop as soon as the first decision-step logits are available
+                    if not first_logits_aborted and last_logits:
+                        first_logits_aborted = True
+                        model_rkllm.abort()
+
                     thread_model.join(timeout=0.005)
                     thread_finished = not thread_model.is_alive()
 
+                # Clear the abort flag if we set it via abort() above so the next task
+                # is not affected (clear_cache after rerank reuses this same worker).
+                if first_logits_aborted:
+                    abort_flag.value = False
+
                 if last_logits:
-                    # Send the last logits result
-                    child_conn.send(last_logits[-1])
+                    # Send the first captured (decision-step) logits result
+                    child_conn.send(last_logits[0])
                 else:
                     # Fallback: send text output for text-based scoring
                     text_output = "".join(global_text)
