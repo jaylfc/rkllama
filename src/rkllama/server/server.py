@@ -246,76 +246,99 @@ def rm_model():
 
     # os.remove(model_path)
 
+# Shared download logic used by both the plain-text /pull route and the
+# Ollama-compatible /api/pull route. Yields structured events instead of
+# formatted text so each caller can render them (plain text vs ndjson).
+def _download_model_events(data):
+    model_spec = data.get("model", data.get("name"))
+    if not model_spec:
+        yield {"event": "error", "message": "Model not specified."}
+        return
+
+    splitted = model_spec.split('/')
+    if len(splitted) < 3:
+        yield {"event": "error", "message": f"Invalid path '{model_spec}'"}
+        return
+
+    # Check if custom name provided:
+    model_name = data.get("model_name") or splitted[len(splitted)-1]
+    file = splitted[2]
+    repo = f"{splitted[0]}/{splitted[1]}"
+
+    try:
+        # Use Hugging Face HfFileSystem to get the file metadata
+        fs = HfFileSystem()
+        file_info = fs.info(repo + "/" + file)
+
+        total_size = file_info["size"]  # File size in bytes
+        if total_size == 0:
+            yield {"event": "error", "message": "Unable to retrieve file size."}
+            return
+
+        # Use config to get models path
+        model_dir = os.path.join(rkllama.config.get_path("models"), model_name)
+        os.makedirs(model_dir, exist_ok=True)
+
+        # Define a file to download
+        local_filename = os.path.join(model_dir, file)
+
+        # Create fonfiguration file for model
+        create_modelfile(huggingface_path=repo, From=file, model_name=model_name)
+
+        yield {"event": "start", "file": file, "total": total_size}
+
+        try:
+            # Download the file with progress
+            url = hf_hub_url(repo_id=repo, filename=file)
+            with requests.get(url, stream=True) as r, open(local_filename, "wb") as f:
+                downloaded_size = 0
+                chunk_size = 8192  # 8KB
+
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        yield {"event": "progress", "file": file, "completed": downloaded_size, "total": total_size}
+
+        except Exception as download_error:
+            # Remove the file if an error occurs during download
+            if os.path.exists(local_filename):
+                os.remove(local_filename)
+            yield {"event": "error", "message": f"Error during download: {str(download_error)}"}
+            return
+
+        # Only report success once the model file is actually on disk, so
+        # /api/tags (and taOS' install check) can see it right after.
+        if not os.path.exists(local_filename) or os.path.getsize(local_filename) == 0:
+            if os.path.exists(local_filename):
+                os.remove(local_filename)
+            yield {"event": "error", "message": "Download finished but model file is missing or empty."}
+            return
+
+        yield {"event": "done", "file": file, "model_name": model_name, "total": total_size}
+
+    except Exception as e:
+        yield {"event": "error", "message": str(e)}
+
+
 # route to pull a model
 @app.route('/pull', methods=['POST'])
 def pull_model():
     @stream_with_context
     def generate_progress():
         data = request.get_json(force=True)
-        if "model" not in data:
-            yield "Error: Model not specified.\n"
-            return
-
-        splitted = data["model"].split('/')
-        if len(splitted) < 3:
-            yield f"Error: Invalid path '{data['model']}'\n"
-            return
-
-        # Check if custom name provided:
-        model_name = splitted[len(splitted)-1] if "model_name" not in data else data["model_name"]
-        file = splitted[2]
-        repo = f"{splitted[0]}/{splitted[1]}"
-
-        try:
-            # Use Hugging Face HfFileSystem to get the file metadata
-            fs = HfFileSystem()
-            file_info = fs.info(repo + "/" + file)
-
-            total_size = file_info["size"]  # File size in bytes
-            if total_size == 0:
-                yield "Error: Unable to retrieve file size.\n"
+        for evt in _download_model_events(data):
+            if evt["event"] == "error":
+                yield f"Error: {evt['message']}\n"
                 return
+            elif evt["event"] == "start":
+                yield f"Downloading {evt['file']} ({evt['total'] / (1024**2):.2f} MB)...\n"
+            elif evt["event"] == "progress":
+                progress = int((evt["completed"] / evt["total"]) * 100)
+                yield f"{progress}%\n"
+            # "done" carries no plain-text line, preserving the existing /pull contract.
 
-            # Use config to get models path
-            model_dir = os.path.join(rkllama.config.get_path("models"), model_name)
-            os.makedirs(model_dir, exist_ok=True)
-
-            # Define a file to download
-            local_filename = os.path.join(model_dir, file)
-
-            # Create fonfiguration file for model
-            create_modelfile(huggingface_path=repo, From=file, model_name=model_name)
-
-            yield f"Downloading {file} ({total_size / (1024**2):.2f} MB)...\n"
-
-            try:
-                # Download the file with progress
-                url = hf_hub_url(repo_id=repo, filename=file)
-                with requests.get(url, stream=True) as r, open(local_filename, "wb") as f:
-                    downloaded_size = 0
-                    chunk_size = 8192  # 8KB
-
-                    for chunk in r.iter_content(chunk_size=chunk_size):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                            progress = int((downloaded_size / total_size) * 100)
-                            yield f"{progress}%\n"
-
-            except Exception as download_error:
-                # Remove the file if an error occurs during download
-                if os.path.exists(local_filename):
-                    os.remove(local_filename)
-                yield f"Error during download: {str(download_error)}\n"
-                return
-
-        except Exception as e:
-            yield f"Error: {str(e)}\n"
-
-    # Use the appropriate content type for streaming responses
-    is_ollama_request = request.path.startswith('/api/')
-    content_type = 'application/x-ndjson' if is_ollama_request else 'text/plain'
-    return Response(generate_progress(), content_type=content_type)
+    return Response(generate_progress(), content_type='text/plain')
 
 # Route for loading a model into the NPU
 @app.route('/load_model', methods=['POST'])
@@ -971,20 +994,38 @@ def create_model():
 
 @app.route('/api/pull', methods=['POST'])
 def pull_model_ollama():
-    # TODO: Implement the pull model
     data = request.get_json(force=True)
-    model = data.get('name',data.get('model'))
-    
+    model = data.get('name', data.get('model'))
+
     if DEBUG_MODE:
         logger.debug(f"API pull request data: {data}")
 
     if not model:
         return jsonify({"error": "Missing model name"}), 400
 
+    @stream_with_context
+    def generate_ndjson():
+        for evt in _download_model_events(data):
+            if evt["event"] == "error":
+                yield json.dumps({"status": "error", "error": evt["message"]}) + "\n"
+                return
+            elif evt["event"] == "start":
+                yield json.dumps({
+                    "status": f"pulling {evt['file']}",
+                    "completed": 0,
+                    "total": evt["total"]
+                }) + "\n"
+            elif evt["event"] == "progress":
+                yield json.dumps({
+                    "status": f"pulling {evt['file']}",
+                    "completed": evt["completed"],
+                    "total": evt["total"]
+                }) + "\n"
+            elif evt["event"] == "done":
+                yield json.dumps({"status": "success"}) + "\n"
+
     # Ollama API uses application/x-ndjson for streaming
-    response_stream = pull_model()  # Call the existing function directly
-    response_stream.content_type = 'application/x-ndjson'
-    return response_stream
+    return Response(generate_ndjson(), content_type='application/x-ndjson')
 
 @app.route('/api/delete', methods=['DELETE'])
 def delete_model_ollama():
