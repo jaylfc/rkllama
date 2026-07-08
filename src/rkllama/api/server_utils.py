@@ -115,7 +115,16 @@ class EndpointHandler:
                    f"is {max_ctx} tokens. Reduce the prompt or conversation "
                    f"history, or increase num_ctx.")
             logger.warning(msg)
-            return jsonify({"error": msg}), 400
+            # Structured payload so a client (e.g. the taOS agent) can tell a
+            # context overflow apart from invalid input or a server fault: a
+            # stable machine-readable ``error`` code plus the numbers, with the
+            # human-readable text kept in ``message`` (taOS#1738).
+            return jsonify({
+                "error": "context_length_exceeded",
+                "message": msg,
+                "prompt_tokens": n_tokens,
+                "max_context": max_ctx,
+            }), 400
         return None
 
     @staticmethod
