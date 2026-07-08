@@ -1808,6 +1808,9 @@ def main():
     parser.add_argument('--debug', action='store_true', help="Enable debug mode")
     parser.add_argument('--models', type=str, help="Path where models will be loaded from")
     parser.add_argument('--llamacpp', type=str, help="Path where llama-server executable exists")
+    parser.add_argument('--preload', type=str, default=None,
+                        help="Comma-separated model names to pre-load at startup (e.g. 'model-a,model-b'). "
+                             "Models are resident before the API starts serving.")
     args = parser.parse_args()
 
     # Load arguments into the config
@@ -1850,6 +1853,26 @@ def main():
     # Set the resource limits
     if os.getuid() == 0:
         resource.setrlimit(resource.RLIMIT_NOFILE, (102400, 102400))
+
+    # Pre-load models if --preload was provided. Restores the flag lost in the
+    # upstream rebase: the taOS systemd unit relies on it so the embedding,
+    # reranker and query-expansion models are resident before the first
+    # request instead of paying the load cost on demand.
+    if args.preload:
+        preload_model_names = [n.strip() for n in args.preload.split(",") if n.strip()]
+        if preload_model_names:
+            print_color(f"Pre-loading {len(preload_model_names)} model(s): {', '.join(preload_model_names)}", "cyan")
+            for model_name in preload_model_names:
+                if variables.worker_manager_rkllm.exists_model_loaded(model_name):
+                    print_color(f"  Model '{model_name}' is already loaded, skipping.", "yellow")
+                    continue
+                print_color(f"  Loading model '{model_name}'...", "cyan")
+                _, error = load_model(model_name)
+                if error:
+                    print_color(f"  Failed to pre-load model '{model_name}': {error}", "red")
+                else:
+                    print_color(f"  Model '{model_name}' loaded successfully.", "green")
+            print_color("Pre-load complete.", "green")
 
     # Start the API server with the chosen port
     print_color(f"Start the API at http://localhost:{port}", "blue")
