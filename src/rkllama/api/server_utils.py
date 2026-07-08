@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
 from .format_utils import create_format_instruction, validate_format_response, get_tool_calls, handle_ollama_response, handle_ollama_embedding_response, get_base64_image_from_pil, get_url_image_from_pil
 from .model_utils import get_property_modelfile
+from .worker import WORKER_TASK_ERROR
 import rkllama.config
 
 # Check for debug mode using the improved method from config
@@ -74,7 +75,66 @@ class EndpointHandler:
 
         # Return the tokens
         return tokenized, prompt_cache_file, final_prompt
-    
+
+    @staticmethod
+    def resolve_max_context(options):
+        """Resolve the context window (in tokens) for a request.
+
+        Mirrors ``RKLLM.__init__`` (num_ctx option, else default_num_ctx) so the
+        pre-flight limit matches the value the native runtime is loaded with.
+        Returns None when the limit cannot be determined so the caller falls
+        back to the worker path instead of rejecting a valid request.
+        """
+        try:
+            return int(float((options or {}).get(
+                "num_ctx", rkllama.config.get("model", "default_num_ctx"))))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def check_context_length(token_ids, options):
+        """Pre-flight guard against prompts that exceed the model context.
+
+        RKLLM's native runtime aborts when the prompt is longer than
+        ``max_context_len`` ("the length of prompt is greater than max
+        context"). That abort leaves the worker with empty metrics, the
+        inference loop then raises and closes its pipe, and the parent reads a
+        closed pipe -> EOFError -> HTTP 500 (taOS#1732). Rejecting here keeps
+        the worker alive and returns an actionable error instead.
+
+        Returns a ``(response, status)`` tuple to return directly, or None when
+        the prompt fits (or the limit is unknown).
+        """
+        max_ctx = EndpointHandler.resolve_max_context(options)
+        if not max_ctx or max_ctx <= 0:
+            return None
+
+        n_tokens = len(token_ids)
+        if n_tokens > max_ctx:
+            msg = (f"Prompt is {n_tokens} tokens but the model context window "
+                   f"is {max_ctx} tokens. Reduce the prompt or conversation "
+                   f"history, or increase num_ctx.")
+            logger.warning(msg)
+            return jsonify({"error": msg}), 400
+        return None
+
+    @staticmethod
+    def recv_worker_token(parent_pipe):
+        """Receive one item from a worker pipe, tolerating worker failure.
+
+        A worker that hits an unrecoverable error (e.g. the native RKLLM
+        runtime aborting because the prompt exceeds the context window,
+        taOS#1732) sends the ``WORKER_TASK_ERROR`` sentinel and closes its
+        pipe; a worker that dies outright just closes the pipe. Either way the
+        parent must not let an EOFError escape and surface as an unhandled HTTP
+        500, so a closed pipe is normalised to the sentinel and callers finish
+        the response cleanly.
+        """
+        try:
+            return parent_pipe.recv()
+        except (EOFError, OSError):
+            return WORKER_TASK_ERROR
+
     @staticmethod
     def add_image_tag_to_last_user_message(messages):
         for msg in reversed(messages):
@@ -260,10 +320,17 @@ class ChatEndpointHandler(EndpointHandler):
             # If Multimodal request, do not use tokenizer
             final_prompt = None
             prompt_cache_file = None
-            if not images:    
+            if not images:
                 # Create the final prompt for token input requests
                 final_prompt, prompt_cache_file, _ = cls.prepare_prompt(model_name, messages, system, tools, enable_thinking, images)
-            
+
+                # Reject prompts that exceed the model context before dispatching
+                # to the worker; otherwise the native runtime aborts and the
+                # worker pipe closes -> EOFError / HTTP 500 (taOS#1732).
+                context_error = cls.check_context_length(final_prompt, options)
+                if context_error is not None:
+                    return context_error
+
             else:
                 if DEBUG_MODE:
                     logger.debug(f"Multimodal request detected. Skipping tokenization.")
@@ -342,7 +409,7 @@ class ChatEndpointHandler(EndpointHandler):
 
             while not thread_finished or not final_sent:
                 if parent_pipe.poll(timeout):  # Timeout in seconds
-                    token = parent_pipe.recv()
+                    token = cls.recv_worker_token(parent_pipe)
                 else:
                     # Abort the current inference
                     variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
@@ -357,6 +424,18 @@ class ChatEndpointHandler(EndpointHandler):
                     thread_finished = True
 
                 # Checking if finished inference
+                # Surface a worker failure (e.g. the prompt exceeding the model
+                # context window, taOS#1732) as a clean end-of-stream instead of
+                # letting a closed pipe raise EOFError -> HTTP 500.
+                if token == WORKER_TASK_ERROR:
+                    logger.error(f"Worker for model {model_name} reported an error during inference; the prompt may exceed the model context window.")
+                    try:
+                        parent_pipe.close()
+                    except Exception:
+                        pass
+                    token = "Inference failed: the worker reported an error. The prompt may exceed the model's context window."
+                    thread_finished = True
+
                 if isinstance(token, tuple):      
                     thread_finished = True
                     # Get the stats from the inference
@@ -487,7 +566,7 @@ class ChatEndpointHandler(EndpointHandler):
 
         while not thread_finished:
             if parent_pipe.poll(timeout):  # Timeout in seconds
-                token = parent_pipe.recv()
+                token = cls.recv_worker_token(parent_pipe)
             else:
 
                 # Abort the current inference
@@ -503,6 +582,18 @@ class ChatEndpointHandler(EndpointHandler):
                 thread_finished = True
  
             # Checking if finished inference
+            # Surface a worker failure (e.g. the prompt exceeding the model
+            # context window, taOS#1732) as a clean end-of-stream instead of
+            # letting a closed pipe raise EOFError -> HTTP 500.
+            if token == WORKER_TASK_ERROR:
+                logger.error(f"Worker for model {model_name} reported an error during inference; the prompt may exceed the model context window.")
+                try:
+                    parent_pipe.close()
+                except Exception:
+                    pass
+                token = "Inference failed: the worker reported an error. The prompt may exceed the model's context window."
+                thread_finished = True
+
             if isinstance(token, tuple):    
                 thread_finished = True
                 # Get the stats from the inference
@@ -635,9 +726,16 @@ class GenerateEndpointHandler(EndpointHandler):
             
             # If Multimodal request, do not use tokenizer
             final_prompt = None
-            if not images:    
+            if not images:
                 # Create the final prompts for token input requests
                 final_prompt, _, _ = cls.prepare_prompt(model_name=model_name, messages=messages, system=system,enable_thinking=enable_thinking, images=images)
+
+                # Reject prompts that exceed the model context before dispatching
+                # to the worker; otherwise the native runtime aborts and the
+                # worker pipe closes -> EOFError / HTTP 500 (taOS#1732).
+                context_error = cls.check_context_length(final_prompt, options)
+                if context_error is not None:
+                    return context_error
             else:
                 if DEBUG_MODE:
                     logger.debug(f"Multimodal request detected. Skipping tokenization.")
@@ -705,7 +803,7 @@ class GenerateEndpointHandler(EndpointHandler):
   
             while not thread_finished or not final_sent:
                 if parent_pipe.poll(timeout):  # Timeout in seconds
-                    token = parent_pipe.recv()
+                    token = cls.recv_worker_token(parent_pipe)
                 else:
                     # Abort the current inference
                     variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
@@ -720,6 +818,18 @@ class GenerateEndpointHandler(EndpointHandler):
                     thread_finished = True
                
                 # Checking if finished inference
+                # Surface a worker failure (e.g. the prompt exceeding the model
+                # context window, taOS#1732) as a clean end-of-stream instead of
+                # letting a closed pipe raise EOFError -> HTTP 500.
+                if token == WORKER_TASK_ERROR:
+                    logger.error(f"Worker for model {model_name} reported an error during inference; the prompt may exceed the model context window.")
+                    try:
+                        parent_pipe.close()
+                    except Exception:
+                        pass
+                    token = "Inference failed: the worker reported an error. The prompt may exceed the model's context window."
+                    thread_finished = True
+
                 if isinstance(token, tuple):      
                     thread_finished = True
                     # Get the stats from the inference
@@ -802,7 +912,7 @@ class GenerateEndpointHandler(EndpointHandler):
 
         while not thread_finished:
             if parent_pipe.poll(timeout):  # Timeout in seconds
-                token = parent_pipe.recv()
+                token = cls.recv_worker_token(parent_pipe)
             else:
                 # Abort the current inference
                 variables.worker_manager_rkllm.workers[model_name].abort_flag.value = True
@@ -817,6 +927,18 @@ class GenerateEndpointHandler(EndpointHandler):
                 thread_finished = True
 
             # Checking if finished inference
+            # Surface a worker failure (e.g. the prompt exceeding the model
+            # context window, taOS#1732) as a clean end-of-stream instead of
+            # letting a closed pipe raise EOFError -> HTTP 500.
+            if token == WORKER_TASK_ERROR:
+                logger.error(f"Worker for model {model_name} reported an error during inference; the prompt may exceed the model context window.")
+                try:
+                    parent_pipe.close()
+                except Exception:
+                    pass
+                token = "Inference failed: the worker reported an error. The prompt may exceed the model's context window."
+                thread_finished = True
+
             if isinstance(token, tuple):  
                 thread_finished = True
                 # Get the stats from the inference
