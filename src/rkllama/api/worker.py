@@ -351,7 +351,7 @@ def run_rkllm_worker(name, task_queue, result_queue, abort_flag, model_path, mod
                 last_logits.clear()
 
                 # Run inference in GET_LOGITS mode
-                thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input,))
+                thread_model = threading.Thread(target=model_rkllm.run, args=(inference_mode, model_input_type, model_input, options))
                 thread_model.start()
 
                 # Rerank only needs the yes/no logits from the single decision step
@@ -1292,7 +1292,7 @@ class WorkerManager:
             model_input = (prompt_input, prompt_cache_file)
 
             # Send the rerank task using GET_LOGITS inference mode
-            parent_conn = self.send_task(model_name, (WORKER_TASK_RERANK, RKLLMInferMode.RKLLM_INFER_GET_LOGITS, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input))
+            parent_conn = self.send_task(model_name, (WORKER_TASK_RERANK, RKLLMInferMode.RKLLM_INFER_GET_LOGITS, RKLLMInputType.RKLLM_INPUT_PROMPT, model_input, {}))
 
             # Clear the KV cache after the rerank task. Without this, repeated rerank
             # requests accumulate KV state on the NPU and response times degrade over
