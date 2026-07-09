@@ -1547,6 +1547,15 @@ class RerankEndpointHandler(EndpointHandler):
 
             # Send rerank task to the worker and get the per-request reply pipe
             parent_pipe = variables.worker_manager_rkllm.rerank(model_name, prompt)
+            if parent_pipe is None:
+                # rerank() returns None when the model is not in the worker
+                # table (e.g. unloaded between the route's check and this
+                # send). Score the document 0 instead of AttributeError-ing.
+                logger.error(
+                    f"Rerank worker for {model_name} unavailable for document {idx}"
+                )
+                results.append({"index": idx, "relevance_score": 0.0})
+                continue
 
             # Wait for the logits result on the per-request pipe
             if parent_pipe.poll(timeout):  # Timeout in seconds
