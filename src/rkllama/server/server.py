@@ -1827,7 +1827,10 @@ def main():
             library_path = importlib.resources.files("rkllama.lib") / f"fix_freq_{processor}.sh"
             #library_path = os.path.join(rkllama.config.get_path("lib"), f"fix_freq_{processor}.sh")
 
-            # Pass debug flag as parameter to the shell script
+            # Pass debug flag as parameter to the shell script. By default the
+            # script pins only the NPU and DDR; RKLLAMA_PIN_CPU / RKLLAMA_PIN_GPU /
+            # RKLLAMA_UNPIN reach it through the inherited environment (see the
+            # script header and documentation/configuration.md).
             debug_param = "1" if DEBUG_MODE else "0"
             command = f"bash {library_path} {debug_param}"
             subprocess.run(command, shell=True)

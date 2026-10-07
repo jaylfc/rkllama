@@ -59,6 +59,13 @@ Special environment variables:
 - `RKLLAMA_DEBUG=(1|true|yes|on)` enables debug mode
 - `RKLLAMA_DEBUG=(0|false|no|off)` disables debug mode
 
+Clock pinning at startup (read by `lib/fix_freq_<processor>.sh`, which runs only when the server runs as root). By default only the NPU and DDR are pinned at max; CPU frequency scaling, CPU idle states and the GPU are left alone.
+- `RKLLAMA_PIN_CPU=1` also disables CPU idle state1 and pins the CPU at max with the `userspace` governor (the old default)
+- `RKLLAMA_PIN_GPU=1` also pins the GPU at max (the old default; rkllama does not use the GPU)
+- `RKLLAMA_UNPIN=1` undoes an earlier CPU/GPU pin (re-enables idle state1, sets the CPU governor to `RKLLAMA_CPU_GOVERNOR`, default `schedutil`, and the GPU governor to `simple_ondemand`); useful once after upgrading, instead of a reboot
+- `RKLLAMA_FREQ_DRY_RUN=1` prints the sysfs writes instead of doing them, e.g. `RKLLAMA_FREQ_DRY_RUN=1 bash src/rkllama/lib/fix_freq_rk3588.sh 1`
+- `RKLLAMA_PIN_CPU=1 RKLLAMA_PIN_GPU=1` together restore the old behaviour exactly
+
 ## Command-line Arguments
 
 RKLLAMA supports command-line arguments with the highest priority:
